@@ -146,7 +146,7 @@ func TestShell(t *testing.T) {
 		stdout bytes.Buffer
 		stderr bytes.Buffer
 	)
-	err = client.Shell().SetStdio(script, &stdout, &stderr).Start()
+	_, err = client.Shell().SetStdio(script, &stdout, &stderr).Start()
 	if err != nil {
 		t.Fatal("Start shell faield: ", err)
 	}

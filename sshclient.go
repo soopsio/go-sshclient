@@ -5,12 +5,13 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"github.com/google/uuid"
+	"golang.org/x/crypto/ssh"
+	goterm "golang.org/x/crypto/ssh/terminal"
 	"io"
 	"io/ioutil"
 	"net"
 	"os"
-
-	"golang.org/x/crypto/ssh"
 )
 
 type remoteScriptType byte
@@ -279,9 +280,11 @@ type remoteShell struct {
 	requestPty     bool
 	terminalConfig *TerminalConfig
 
-	stdin  io.Reader
-	stdout io.Writer
-	stderr io.Writer
+	session   *ssh.Session
+	channelID string
+	stdin     io.Reader
+	stdout    io.Writer
+	stderr    io.Writer
 }
 
 type TerminalConfig struct {
@@ -292,12 +295,36 @@ type TerminalConfig struct {
 }
 
 // Terminal create a interactive shell on client.
-func (c *Client) Terminal(config *TerminalConfig) *remoteShell {
+func (c *Client) Terminal(config *TerminalConfig) (*remoteShell, error) {
+	session, err := c.client.NewSession()
+	if err != nil {
+		return nil, err
+	}
+
+	if config == nil {
+		config = &TerminalConfig{
+			// Set up terminal modes
+			// https://net-ssh.github.io/net-ssh/classes/Net/SSH/Connection/Term.html
+			// https://www.ietf.org/rfc/rfc4254.txt
+			// https://godoc.org/golang.org/x/crypto/ssh
+			// THIS IS THE TITLE
+			// https://pythonhosted.org/ANSIColors-balises/ANSIColors.html
+			Modes: ssh.TerminalModes{
+				ssh.ECHO:          1,     // enable echoing    # terminal raw mode enable
+				ssh.IGNCR:         0,     // don't ignore CR on input. # terminal raw mode diable
+				ssh.TTY_OP_ISPEED: 14400, // input speed = 14.4kbaud
+				ssh.TTY_OP_OSPEED: 14400, // output speed = 14.4kbaud
+			},
+		}
+	}
+
 	return &remoteShell{
 		client:         c.client,
 		terminalConfig: config,
 		requestPty:     true,
-	}
+		session:        session,
+		channelID:      uuid.New().String(),
+	}, nil
 }
 
 // Shell create a noninteractive shell on client.
@@ -315,51 +342,85 @@ func (rs *remoteShell) SetStdio(stdin io.Reader, stdout, stderr io.Writer) *remo
 	return rs
 }
 
+func (rs *remoteShell) WindowChange(h, w int) error {
+	return rs.session.WindowChange(h, w)
+}
+
+func (rs *remoteShell) ChannelID() string {
+	return rs.channelID
+}
+
 // Start start a remote shell on client
-func (rs *remoteShell) Start() error {
-	session, err := rs.client.NewSession()
-	if err != nil {
-		return err
-	}
-	defer session.Close()
+func (rs *remoteShell) Start() (int, error) {
+	defer rs.session.Close()
+	//stdin, err := rs.session.StdinPipe()
+	//if err != nil {
+	//	log.Fatalf("Unable to setup stdin for session: %v\n", err)
+	//}
+
+	//
+	//stdout, err := rs.session.StdoutPipe()
+	//if err != nil {
+	//	log.Fatalf("Unable to setup stdout for session: %v\n", err)
+	//}
+
+	//stderr, err := rs.session.StderrPipe()
+	//if err != nil {
+	//	log.Fatalf("Unable to setup stderr for session: %v\n", err)
+	//}
 
 	if rs.stdin == nil {
-		session.Stdin = os.Stdin
+		oldState, err := goterm.MakeRaw(int(os.Stdin.Fd()))
+		if err != nil {
+			return -1, err
+		}
+		defer goterm.Restore(0, oldState)
+		rs.session.Stdin = os.Stdin
+		//go io.Copy(stdin, os.Stdin)
 	} else {
-		session.Stdin = rs.stdin
+		rs.session.Stdin = rs.stdin
+		//go io.Copy(stdin, rs.stdin)
 	}
 	if rs.stdout == nil {
-		session.Stdout = os.Stdout
+		rs.session.Stdout = os.Stdout
+		//go io.Copy(os.Stdout, stdout)
 	} else {
-		session.Stdout = rs.stdout
+		rs.session.Stdout = rs.stdout
+		//go io.Copy(rs.stdout, stdout)
 	}
 	if rs.stderr == nil {
-		session.Stderr = os.Stderr
+		rs.session.Stderr = os.Stderr
+		//go io.Copy(os.Stderr, stderr)
 	} else {
-		session.Stderr = rs.stderr
+		rs.session.Stderr = rs.stderr
+		//go io.Copy(rs.stderr, stderr)
 	}
 
 	if rs.requestPty {
 		tc := rs.terminalConfig
 		if tc == nil {
 			tc = &TerminalConfig{
-				Term:   "xterm",
+				Term:   "xterm-256color",
 				Hight:  40,
 				Weight: 80,
 			}
 		}
-		if err := session.RequestPty(tc.Term, tc.Hight, tc.Weight, tc.Modes); err != nil {
-			return err
+		if err := rs.session.RequestPty(tc.Term, tc.Hight, tc.Weight, tc.Modes); err != nil {
+			return -1, err
 		}
 	}
 
-	if err := session.Shell(); err != nil {
-		return err
+	if err := rs.session.Shell(); err != nil {
+		return -1, err
 	}
 
-	if err := session.Wait(); err != nil {
-		return err
+	if err := rs.session.Wait(); err != nil {
+		if err, ok := err.(*ssh.ExitError); ok {
+			return err.ExitStatus(), nil
+		} else {
+			return -1, errors.New("failed to wait ssh command: " + err.Error())
+		}
 	}
 
-	return nil
+	return 0, nil
 }
